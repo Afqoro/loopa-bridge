@@ -1,0 +1,25 @@
+# Binaries
+loopa-bridge
+*.exe
+bin/
+
+# Go
+vendor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Env & secrets
+.env
+*.env
+ecosystem.*.config.js
+
+# Logs
+*.log
