@@ -58,6 +58,24 @@ func main() {
 		})
 	})
 
+	// Credits endpoint - check remaining loopa.im credits via signed REST API
+	mux.HandleFunc("/v1/credits", func(w http.ResponseWriter, r *http.Request) {
+		perm, err := CheckCredit(cfg)
+		if err != nil {
+			writeOAIError(w, http.StatusBadGateway, "credit_check_failed", err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"free_credits":    perm.Data.FreeCredits,
+			"credits":         perm.Data.Credits,
+			"images":          perm.Data.Images,
+			"musics":          perm.Data.Musics,
+			"vip":             perm.Data.VIP,
+			"raw":             perm,
+		})
+	})
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{

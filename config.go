@@ -29,6 +29,12 @@ type Config struct {
 	// Bridge auth (optional)
 	APIKey string
 
+	// REST API sign params
+	ClientName    string // web_app_key, e.g. epm_web
+	SignKey       string // e.g. e84yr70o0a5n08f5
+	ProductCode   string // e.g. 666
+	LocalAPIBase  string // e.g. https://www.loopa.im
+
 	// Auth file fallback
 	AuthFile string
 }
@@ -39,13 +45,17 @@ func LoadConfig() *Config {
 		Port:         envOr("LOOPA_PORT", "18768"),
 		Host:         envOr("LOOPA_HOST", "0.0.0.0"),
 		WSEndpoint:   envOr("LOOPA_WS_ENDPOINT", "wss://www.loopa.im/nanobot-proxy-socket/api/easeclaw/ws/web:new"),
-		AccessToken: envOr("LOOPA_ACCESS_TOKEN", ""),
+		AccessToken:  envOr("LOOPA_ACCESS_TOKEN", ""),
 		DefaultModel: envOr("LOOPA_DEFAULT_MODEL", "minimax/minimax-m3"),
 		ImageModel:   envOr("LOOPA_IMAGE_MODEL", "GPT Image 2"),
 		VideoModel:   envOr("LOOPA_VIDEO_MODEL", "Seedance 2.0"),
 		AudioModel:   envOr("LOOPA_AUDIO_MODEL", "Suno"),
 		Timezone:     envOr("LOOPA_TIMEZONE", "Asia/Shanghai"),
 		APIKey:       envOr("LOOPA_API_KEY", ""),
+		ClientName:   envOr("LOOPA_CLIENT_NAME", "epm_web"),
+		SignKey:      envOr("LOOPA_SIGN_KEY", "e84yr70o0a5n08f5"),
+		ProductCode:  envOr("LOOPA_PRODUCT_CODE", "666"),
+		LocalAPIBase: envOr("LOOPA_LOCAL_API_BASE", "https://www.loopa.im"),
 		AuthFile:     envOr("LOOPA_AUTH_FILE", "/tmp/loopa-auth.json"),
 	}
 
