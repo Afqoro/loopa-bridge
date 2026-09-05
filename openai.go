@@ -4,38 +4,66 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
 
 // OpenAI Chat Completions Request
 type OAIChatRequest struct {
-	Model       string      `json:"model"`
+	Model       string       `json:"model"`
 	Messages    []OAIMessage `json:"messages"`
-	Stream      bool        `json:"stream"`
-	Temperature *float64    `json:"temperature,omitempty"`
-	MaxTokens   *int        `json:"max_tokens,omitempty"`
+	Stream      bool         `json:"stream"`
+	Temperature *float64     `json:"temperature,omitempty"`
+	MaxTokens   *int         `json:"max_tokens,omitempty"`
+	Tools       []OAITool    `json:"tools,omitempty"`
+	ToolChoice  interface{}  `json:"tool_choice,omitempty"`
 }
 
 type OAIMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role      string         `json:"role"`
+	Content   string         `json:"content"`
+	ToolCalls []OAIToolCall  `json:"tool_calls,omitempty"`
+	ToolCallID string       `json:"tool_call_id,omitempty"`
+	Name      string         `json:"name,omitempty"`
+}
+
+type OAITool struct {
+	Type     string         `json:"type"`
+	Function OAIToolFunction `json:"function"`
+}
+
+type OAIToolFunction struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Parameters  interface{} `json:"parameters"`
+}
+
+type OAIToolCall struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
+	Function OAIToolCallFunc  `json:"function"`
+}
+
+type OAIToolCallFunc struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 // OpenAI Chat Completions Response (non-stream)
 type OAIChatResponse struct {
-	ID      string         `json:"id"`
-	Object  string         `json:"object"`
-	Created int64          `json:"created"`
-	Model   string         `json:"model"`
-	Choices []OAIChoice    `json:"choices"`
-	Usage   OAIUsage       `json:"usage"`
+	ID      string      `json:"id"`
+	Object  string      `json:"object"`
+	Created int64       `json:"created"`
+	Model   string      `json:"model"`
+	Choices []OAIChoice `json:"choices"`
+	Usage   OAIUsage    `json:"usage"`
 }
 
 type OAIChoice struct {
-	Index        int       `json:"index"`
-	Message      OAIMessage `json:"message"`
-	FinishReason string    `json:"finish_reason"`
+	Index        int            `json:"index"`
+	Message      OAIMessage     `json:"message"`
+	FinishReason string         `json:"finish_reason"`
 }
 
 type OAIUsage struct {
@@ -46,22 +74,23 @@ type OAIUsage struct {
 
 // OpenAI SSE chunk (stream)
 type OAIChunk struct {
-	ID      string         `json:"id"`
-	Object  string         `json:"object"`
-	Created int64          `json:"created"`
-	Model   string         `json:"model"`
-	Choices []OAIChunkChoice `json:"choices"`
+	ID      string           `json:"id"`
+	Object  string           `json:"object"`
+	Created int64             `json:"created"`
+	Model   string             `json:"model"`
+	Choices []OAIChunkChoice  `json:"choices"`
 }
 
 type OAIChunkChoice struct {
-	Index        int          `json:"index"`
-	Delta        OAIDelta     `json:"delta"`
-	FinishReason *string      `json:"finish_reason"`
+	Index        int           `json:"index"`
+	Delta        OAIDelta      `json:"delta"`
+	FinishReason *string       `json:"finish_reason"`
 }
 
 type OAIDelta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role      string          `json:"role,omitempty"`
+	Content   string          `json:"content,omitempty"`
+	ToolCalls []OAIToolCall   `json:"tool_calls,omitempty"`
 }
 
 // HandleChatCompletions is the main OpenAI-compatible endpoint
@@ -79,7 +108,6 @@ func (s *BridgeServer) HandleChatCompletions(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Auth check (optional)
 	if s.config.APIKey != "" {
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, "Bearer ") || strings.TrimPrefix(auth, "Bearer ") != s.config.APIKey {
@@ -94,9 +122,7 @@ func (s *BridgeServer) HandleChatCompletions(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Flatten messages into a single prompt (loopa WS only takes a single content string)
-	// Use last user message as the prompt, prepend system context if present
-	prompt := buildPrompt(req.Messages)
+	prompt := buildPrompt(req.Messages, req.Tools)
 	if prompt == "" {
 		writeOAIError(w, http.StatusBadRequest, "invalid_request", "no user message found")
 		return
@@ -108,13 +134,13 @@ func (s *BridgeServer) HandleChatCompletions(w http.ResponseWriter, r *http.Requ
 	}
 
 	if req.Stream {
-		s.handleStream(w, r, prompt, model)
+		s.handleStream(w, r, prompt, model, len(req.Tools) > 0)
 	} else {
-		s.handleNonStream(w, r, prompt, model)
+		s.handleNonStream(w, r, prompt, model, len(req.Tools) > 0)
 	}
 }
 
-func (s *BridgeServer) handleNonStream(w http.ResponseWriter, r *http.Request, prompt, model string) {
+func (s *BridgeServer) handleNonStream(w http.ResponseWriter, r *http.Request, prompt, model string, hasTools bool) {
 	client, err := NewLoopaClient(s.config)
 	if err != nil {
 		writeOAIError(w, http.StatusBadGateway, "upstream_error", fmt.Sprintf("ws connect: %v", err))
@@ -127,11 +153,11 @@ func (s *BridgeServer) handleNonStream(w http.ResponseWriter, r *http.Request, p
 		return
 	}
 
-	// Collect all messages until status=completed
 	var assistantText strings.Builder
-	var toolOutputs []string
+	var toolCalls []OAIToolCall
 	var attachments []LoopaAttachment
-	deadline := time.Now().Add(120 * time.Second)
+	var toolCallIdx int
+	deadline := time.Now().Add(180 * time.Second)
 
 	for time.Now().Before(deadline) {
 		msg, err := client.ReadMessage(120 * time.Second)
@@ -157,10 +183,11 @@ func (s *BridgeServer) handleNonStream(w http.ResponseWriter, r *http.Request, p
 				}
 				assistantText.WriteString(msg.Content)
 			} else if msg.Role == "assistant" && msg.Name != "" {
-				// tool call — include as text
-				toolOutputs = append(toolOutputs, fmt.Sprintf("[%s] %s", msg.Name, msg.Content))
-			} else if msg.Role == "tool" {
-				toolOutputs = append(toolOutputs, fmt.Sprintf("[tool:%s] %s", msg.Name, msg.Content))
+				// Tool call from loopa — convert to OAI tool_calls
+				tc := parseLoopaToolCall(msg.Name, msg.Content, &toolCallIdx)
+				if tc != nil {
+					toolCalls = append(toolCalls, *tc)
+				}
 			}
 			if msg.Status == "completed" {
 				attachments = msg.Attachments
@@ -170,14 +197,16 @@ func (s *BridgeServer) handleNonStream(w http.ResponseWriter, r *http.Request, p
 	}
 
 done:
-	fullText := assistantText.String()
-	if len(toolOutputs) > 0 {
-		fullText += "\n\n--- Tool Output ---\n" + strings.Join(toolOutputs, "\n\n")
+	finishReason := "stop"
+	if len(toolCalls) > 0 {
+		finishReason = "tool_calls"
 	}
+
+	content := assistantText.String()
 	if len(attachments) > 0 {
-		fullText += "\n\n--- Attachments ---\n"
+		content += "\n\n--- Attachments ---\n"
 		for _, a := range attachments {
-			fullText += fmt.Sprintf("- %s (%s, %d bytes, id=%s)\n", a.Name, a.ContentType, a.Size, a.FileID)
+			content += fmt.Sprintf("- %s (%s, %d bytes, id=%s)\n", a.Name, a.ContentType, a.Size, a.FileID)
 		}
 	}
 
@@ -188,18 +217,22 @@ done:
 		Model:   model,
 		Choices: []OAIChoice{
 			{
-				Index:        0,
-				Message:      OAIMessage{Role: "assistant", Content: fullText},
-				FinishReason: "stop",
+				Index: 0,
+				Message: OAIMessage{
+					Role:      "assistant",
+					Content:   content,
+					ToolCalls: toolCalls,
+				},
+				FinishReason: finishReason,
 			},
 		},
-		Usage: OAIUsage{PromptTokens: len(prompt) / 4, CompletionTokens: len(fullText) / 4, TotalTokens: (len(prompt) + len(fullText)) / 4},
+		Usage: OAIUsage{PromptTokens: len(prompt) / 4, CompletionTokens: len(content) / 4, TotalTokens: (len(prompt) + len(content)) / 4},
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-func (s *BridgeServer) handleStream(w http.ResponseWriter, r *http.Request, prompt, model string) {
+func (s *BridgeServer) handleStream(w http.ResponseWriter, r *http.Request, prompt, model string, hasTools bool) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -227,11 +260,12 @@ func (s *BridgeServer) handleStream(w http.ResponseWriter, r *http.Request, prom
 	// Send initial role chunk
 	sendSSEChunk(w, flusher, chatID, created, model, &OAIDelta{Role: "assistant"}, nil)
 
+	var toolCallIdx int
 	deadline := time.Now().Add(180 * time.Second)
 	for time.Now().Before(deadline) {
 		msg, err := client.ReadMessage(120 * time.Second)
 		if err != nil {
-			sendSSEError(w, flusher, fmt.Sprintf("read: %v", err))
+		sendSSEError(w, flusher, fmt.Sprintf("read: %v", err))
 			return
 		}
 
@@ -251,22 +285,27 @@ func (s *BridgeServer) handleStream(w http.ResponseWriter, r *http.Request, prom
 			}
 		case "message":
 			if msg.Role == "assistant" && msg.Content != "" {
-				// Stream assistant content (skip tool call internals for clean text)
 				if msg.Name == "" {
-					sendSSEChunk(w, flusher, chatID, created, model, &OAIDelta{Content: msg.Content + "\n"}, nil)
+					sendSSEChunk(w, flusher, chatID, created, model, &OAIDelta{Content: msg.Content}, nil)
 				} else {
-					// Tool call — send as content with marker
-					sendSSEChunk(w, flusher, chatID, created, model, &OAIDelta{Content: fmt.Sprintf("\n[tool:%s] %s\n", msg.Name, msg.Content)}, nil)
+					// Tool call — emit as proper OAI tool_calls delta
+					tc := parseLoopaToolCall(msg.Name, msg.Content, &toolCallIdx)
+					if tc != nil {
+						sendSSEChunk(w, flusher, chatID, created, model, &OAIDelta{ToolCalls: []OAIToolCall{*tc}}, nil)
+					}
 				}
 			} else if msg.Role == "tool" {
-				sendSSEChunk(w, flusher, chatID, created, model, &OAIDelta{Content: fmt.Sprintf("[output] %s\n", msg.Content)}, nil)
+				// Tool result — stream as content (for visibility) but don't emit as separate tool_calls
+				sendSSEChunk(w, flusher, chatID, created, model, &OAIDelta{Content: fmt.Sprintf("[tool output] %s\n", msg.Content)}, nil)
 			}
 			if msg.Status == "completed" {
-				// Send attachments info if any
 				for _, a := range msg.Attachments {
 					sendSSEChunk(w, flusher, chatID, created, model, &OAIDelta{Content: fmt.Sprintf("\n[attachment] %s (%d bytes, id=%s)\n", a.Name, a.Size, a.FileID)}, nil)
 				}
 				reason := "stop"
+				if toolCallIdx > 0 {
+					reason = "tool_calls"
+				}
 				sendSSEChunk(w, flusher, chatID, created, model, &OAIDelta{}, &reason)
 				fmt.Fprintf(w, "data: [DONE]\n\n")
 				flusher.Flush()
@@ -275,11 +314,84 @@ func (s *BridgeServer) handleStream(w http.ResponseWriter, r *http.Request, prom
 		}
 	}
 
-	// Timeout
 	reason := "length"
 	sendSSEChunk(w, flusher, chatID, created, model, &OAIDelta{}, &reason)
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
+}
+
+// parseLoopaToolCall converts a loopa WS tool-call message into an OpenAI tool_calls entry.
+// Loopa format: role=assistant, name="exec|read_file|write_file", content="exec(\"cmd\")" or "read_file(\"path\")"
+func parseLoopaToolCall(toolName, content string, idx *int) *OAIToolCall {
+	*idx++
+	id := fmt.Sprintf("call_loopa_%d", *idx)
+
+	// Extract arguments as JSON string
+	args := extractToolArgs(toolName, content)
+
+	return &OAIToolCall{
+		ID:   id,
+		Type: "function",
+		Function: OAIToolCallFunc{
+			Name:      toolName,
+			Arguments: args,
+		},
+	}
+}
+
+// extractToolArgs parses loopa tool content into JSON arguments string
+// e.g. exec("ls -la") -> {"command":"ls -la"}
+//      read_file("/tmp/foo") -> {"path":"/tmp/foo"}
+//      write_file("/tmp/foo", "content...") -> {"path":"/tmp/foo","content":"content..."}
+func extractToolArgs(toolName, content string) string {
+	switch toolName {
+	case "exec":
+		cmd := extractQuotedString(content)
+		args, _ := json.Marshal(map[string]string{"command": cmd})
+		return string(args)
+	case "read_file":
+		path := extractQuotedString(content)
+		args, _ := json.Marshal(map[string]string{"path": path})
+		return string(args)
+	case "write_file":
+		// Try to extract path + content (two quoted strings)
+		parts := extractTwoQuotedStrings(content)
+		if len(parts) >= 2 {
+			args, _ := json.Marshal(map[string]string{"path": parts[0], "content": parts[1]})
+			return string(args)
+		}
+		// Fallback: just path
+		path := extractQuotedString(content)
+		args, _ := json.Marshal(map[string]string{"path": path})
+		return string(args)
+	default:
+		// Unknown tool — pass content as-is in "input" field
+		args, _ := json.Marshal(map[string]string{"input": content})
+		return string(args)
+	}
+}
+
+// extractQuotedString extracts the first double-quoted string from content
+var quotedStringRe = regexp.MustCompile(`"((?:[^"\\]|\\.)*)"`)
+
+func extractQuotedString(content string) string {
+	m := quotedStringRe.FindStringSubmatch(content)
+	if len(m) >= 2 {
+		return m[1]
+	}
+	return content
+}
+
+// extractTwoQuotedStrings extracts first two double-quoted strings from content
+func extractTwoQuotedStrings(content string) []string {
+	matches := quotedStringRe.FindAllStringSubmatch(content, 2)
+	var result []string
+	for _, m := range matches {
+		if len(m) >= 2 {
+			result = append(result, m[1])
+		}
+	}
+	return result
 }
 
 func sendSSEChunk(w http.ResponseWriter, flusher http.Flusher, id string, created int64, model string, delta *OAIDelta, finishReason *string) {
@@ -322,10 +434,26 @@ func writeOAIError(w http.ResponseWriter, status int, errType, message string) {
 	})
 }
 
-// buildPrompt flattens OpenAI messages into a single prompt string
-func buildPrompt(messages []OAIMessage) string {
+// buildPrompt flattens OpenAI messages + tools into a single prompt string for loopa WS
+func buildPrompt(messages []OAIMessage, tools []OAITool) string {
 	var parts []string
 	var userMsg string
+
+	// If tools are provided, inject as system instruction so loopa model knows available tools
+	if len(tools) > 0 {
+		var toolDefs []string
+		for _, t := range tools {
+			td := fmt.Sprintf("- %s: %s", t.Function.Name, t.Function.Description)
+			if t.Function.Parameters != nil {
+				if pj, err := json.Marshal(t.Function.Parameters); err == nil {
+					td += fmt.Sprintf(" (params: %s)", string(pj))
+				}
+			}
+			toolDefs = append(toolDefs, td)
+		}
+		parts = append(parts, fmt.Sprintf("[Available Tools]\n%s", strings.Join(toolDefs, "\n")))
+	}
+
 	for _, m := range messages {
 		switch m.Role {
 		case "system":
@@ -333,12 +461,18 @@ func buildPrompt(messages []OAIMessage) string {
 		case "user":
 			userMsg = m.Content
 		case "assistant":
-			parts = append(parts, fmt.Sprintf("[Previous Assistant]\n%s", m.Content))
+			if m.Content != "" {
+				parts = append(parts, fmt.Sprintf("[Previous Assistant]\n%s", m.Content))
+			}
+			if len(m.ToolCalls) > 0 {
+				for _, tc := range m.ToolCalls {
+					parts = append(parts, fmt.Sprintf("[Previous Tool Call]\n%s(%s)", tc.Function.Name, tc.Function.Arguments))
+				}
+			}
 		case "tool":
-			parts = append(parts, fmt.Sprintf("[Tool Output]\n%s", m.Content))
+			parts = append(parts, fmt.Sprintf("[Tool Output: %s]\n%s", m.Name, m.Content))
 		}
 	}
-	// Prepend context, then user message
 	if len(parts) > 0 && userMsg != "" {
 		return strings.Join(parts, "\n\n") + "\n\n---\n\n" + userMsg
 	}
